@@ -1,0 +1,131 @@
+version: '3.8'
+
+# Hummingbot SaaS Platform - 完整部署配置
+# 包含：Portal API、PostgreSQL、Redis、Traefik
+
+services:
+  # ==================== Portal API ====================
+  portal-api:
+    build: .
+    container_name: hummingbot-portal-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@postgres:5432/hummingbot_saas
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+    ports:
+      - "8000:8000"
+    volumes:
+      - /srv/tenants:/srv/tenants
+      - /srv/backups:/srv/backups
+      - /var/run/docker.sock:/var/run/docker.sock  # 用于管理客户栈
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - portal-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.portal-api.rule=Host(`api.${BASE_DOMAIN}`)"
+      - "traefik.http.routers.portal-api.entrypoints=websecure"
+      - "traefik.http.routers.portal-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.portal-api.loadbalancer.server.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ==================== PostgreSQL ====================
+  postgres:
+    image: postgres:15-alpine
+    container_name: hummingbot-portal-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hummingbot_saas
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - portal-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Redis ====================
+  redis:
+    image: redis:7-alpine
+    container_name: hummingbot-portal-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    networks:
+      - portal-network
+
+  # ==================== Traefik (反向代理) ====================
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Traefik Dashboard
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ADMIN_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/acme.json"
+      - "--log.level=INFO"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_acme:/acme.json
+    networks:
+      - portal-network
+
+  # ==================== Celery Worker (可选：异步任务) ====================
+  celery-worker:
+    build: .
+    container_name: hummingbot-celery-worker
+    restart: unless-stopped
+    command: celery -A core.tasks worker --loglevel=info
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://postgres:${DB_PASSWORD}@postgres:5432/hummingbot_saas
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+    volumes:
+      - /srv/tenants:/srv/tenants
+      - /srv/backups:/srv/backups
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - portal-network
+    profiles:
+      - with-celery  # 使用 --profile with-celery 启动
+
+# ==================== 网络 ====================
+networks:
+  portal-network:
+    driver: bridge
+
+# ==================== 持久化存储 ====================
+volumes:
+  postgres_data:
+  redis_data:
+  traefik_acme:
