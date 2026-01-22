@@ -1,0 +1,204 @@
+version: '3.8'
+
+# Hummingbot 客户栈完整配置
+# 每个用户一套独立的环境
+
+services:
+  # ==================== PostgreSQL 数据库 ====================
+  postgres:
+    image: postgres:15-alpine
+    container_name: {{ tenant_code }}-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hummingbot
+      POSTGRES_USER: hummingbot
+      POSTGRES_PASSWORD: {{ postgres_password }}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - {{ tenant_code }}-network
+    deploy:
+      resources:
+        limits:
+          cpus: '{{ cpu_limit * 0.2 }}'
+          memory: {{ memory_limit_mb * 0.2 }}M
+        reservations:
+          cpus: '{{ cpu_limit * 0.1 }}'
+          memory: {{ memory_limit_mb * 0.1 }}M
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hummingbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Redis ====================
+  redis:
+    image: redis:7-alpine
+    container_name: {{ tenant_code }}-redis
+    restart: unless-stopped
+    command: redis-server --requirepass {{ redis_password }} --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - {{ tenant_code }}-network
+    deploy:
+      resources:
+        limits:
+          cpus: '{{ cpu_limit * 0.1 }}'
+          memory: 128M
+
+  # ==================== Hummingbot Core ====================
+  hummingbot:
+    image: hummingbot/hummingbot:{{ hummingbot_version }}
+    container_name: {{ tenant_code }}-hummingbot
+    restart: unless-stopped
+    environment:
+      # 配置文件路径
+      CONFIG_FILE_NAME: conf_global.yml
+      CONFIG_PASSWORD: {{ hummingbot_password }}
+      # 数据库连接
+      DB_MODE: LEGACY_TRADE_FILLS
+      SCRIPT_ENABLED: true
+      # 网络设置
+      NETWORK_TIMEOUT: 30
+    volumes:
+      # 配置文件
+      - ./configs:/home/hummingbot/conf
+      # 策略脚本
+      - ./scripts:/home/hummingbot/scripts
+      # 日志
+      - ./logs:/home/hummingbot/logs
+      # 数据
+      - ./data/hummingbot:/home/hummingbot/data
+    networks:
+      - {{ tenant_code }}-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          cpus: '{{ cpu_limit * 0.4 }}'
+          memory: {{ memory_limit_mb * 0.4 }}M
+        reservations:
+          cpus: '{{ cpu_limit * 0.2 }}'
+          memory: {{ memory_limit_mb * 0.2 }}M
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; exit(0 if os.path.exists('/home/hummingbot/logs') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ==================== Hummingbot Gateway (可选，用于 DEX) ====================
+  gateway:
+    image: hummingbot/gateway:{{ gateway_version }}
+    container_name: {{ tenant_code }}-gateway
+    restart: unless-stopped
+    environment:
+      GATEWAY_PASSPHRASE: {{ gateway_passphrase }}
+      GATEWAY_PORT: 15888
+      CERT_PATH: /home/gateway/certs
+    volumes:
+      - ./data/gateway:/home/gateway/conf
+      - ./certs:/home/gateway/certs
+    networks:
+      - {{ tenant_code }}-network
+    ports:
+      - "{{ gateway_port }}:15888"  # 每个租户不同端口
+    depends_on:
+      - hummingbot
+    deploy:
+      resources:
+        limits:
+          cpus: '{{ cpu_limit * 0.15 }}'
+          memory: {{ memory_limit_mb * 0.15 }}M
+    profiles:
+      - with-gateway  # 默认不启动，按需启动
+
+  # ==================== Hummingbot Dashboard ====================
+  dashboard:
+    image: hummingbot/dashboard:{{ dashboard_version }}
+    container_name: {{ tenant_code }}-dashboard
+    restart: unless-stopped
+    environment:
+      # Dashboard 配置
+      BACKEND_API_HOST: hummingbot
+      BACKEND_API_PORT: 8080
+      HUMMINGBOT_INSTANCE_ID: {{ tenant_code }}
+      # 数据库连接
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: hummingbot
+      DB_USER: hummingbot
+      DB_PASSWORD: {{ postgres_password }}
+    volumes:
+      - ./data/dashboard:/data
+      - ./logs:/logs:ro  # 只读访问日志
+    networks:
+      - {{ tenant_code }}-network
+    depends_on:
+      - hummingbot
+      - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: '{{ cpu_limit * 0.15 }}'
+          memory: {{ memory_limit_mb * 0.15 }}M
+    # Traefik 标签（自动配置反向代理）
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.{{ tenant_code }}-dashboard.rule=Host(`{{ subdomain }}`)"
+      - "traefik.http.routers.{{ tenant_code }}-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.{{ tenant_code }}-dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.services.{{ tenant_code }}-dashboard.loadbalancer.server.port=8501"
+      # 安全头
+      - "traefik.http.middlewares.{{ tenant_code }}-auth.basicauth.users={{ dashboard_auth }}"
+      - "traefik.http.routers.{{ tenant_code }}-dashboard.middlewares={{ tenant_code }}-auth"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==================== 监控代理 ====================
+  # 收集容器指标并上报到 Portal
+  monitor:
+    image: prom/node-exporter:latest
+    container_name: {{ tenant_code }}-monitor
+    restart: unless-stopped
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - {{ tenant_code }}-network
+    deploy:
+      resources:
+        limits:
+          cpus: '0.05'
+          memory: 64M
+    profiles:
+      - with-monitoring
+
+# ==================== 网络 ====================
+networks:
+  {{ tenant_code }}-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: {{ subnet }}  # 每个租户独立子网
+
+# ==================== 持久化存储 ====================
+volumes:
+  postgres_data:
+  redis_data:
+  hummingbot_data:
+  dashboard_data:
